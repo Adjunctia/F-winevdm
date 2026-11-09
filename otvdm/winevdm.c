@@ -904,6 +904,13 @@ int entry_point( int argc, char *argv[] )
         BOOL res = ActivateActCtx(result, &lpCookie);
     }
 
+    if (krnl386_config_report_enabled())
+    {
+        char note[MAX_PATH + 32];
+        _snprintf(note, sizeof(note) - 1, "launching win16 app '%s'", appname);
+        note[sizeof(note) - 1] = 0;
+        config_report_note(note);
+    }
     exec16(params, appname, cmdline, TRUE);
     /* wait forever; the process will be killed when the last task exits */
     ReleaseThunkLock(&count);

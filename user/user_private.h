@@ -128,6 +128,15 @@ typedef struct
 #define HINSTANCE_32(h16)  ((HINSTANCE)(ULONG_PTR)(h16))
 
 extern HICON16 get_icon_16( HICON icon ) DECLSPEC_HIDDEN;
+
+/* [otvdm] ConfigReport diagnostic line (user.c) */
+extern void report_note( const char *fmt, ... ) DECLSPEC_HIDDEN;
+/* [otvdm] PreferredMonitor (user.c / window.c) */
+extern BOOL preferred_monitor_app_screen( SIZE *screen, RECT *work ) DECLSPEC_HIDDEN;
+extern BOOL preferred_monitor_to_real( HWND hwnd, INT *x, INT *y, INT cx, INT cy ) DECLSPEC_HIDDEN;
+extern BOOL preferred_monitor_to_app( HWND hwnd, INT *x, INT *y, INT cx, INT cy ) DECLSPEC_HIDDEN;
+
+
 extern HICON get_icon_32( HICON16 icon16 ) DECLSPEC_HIDDEN;
 
 extern DWORD USER16_AlertableWait DECLSPEC_HIDDEN;

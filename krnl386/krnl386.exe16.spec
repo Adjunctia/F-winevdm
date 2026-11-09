@@ -887,3 +887,6 @@
 @ stdcall -arch=win32 VDDInstallIOHook(long long ptr ptr)
 @ stdcall -arch=win32 VDDDeInstallIOHook(long long ptr)
 @ stdcall -arch=win32 MGetVdmPointer(long long long)
+@ stdcall -arch=win32 config_report_note(str)
+@ stdcall -arch=win32 krnl386_config_report_enabled()
+@ stdcall -arch=win32 krnl386_get_preferred_monitor(ptr ptr ptr)

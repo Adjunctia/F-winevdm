@@ -564,6 +564,11 @@ BOOL16      WINAPI WriteProfileSection16(LPCSTR,LPCSTR);
 
 DWORD WINAPI krnl386_get_config_string(LPCSTR appname, LPCSTR keyname, LPCSTR def, LPSTR ret, DWORD size);
 DWORD WINAPI krnl386_get_config_int(LPCSTR appname, LPCSTR keyname, INT def);
+/* [otvdm] ConfigReport diagnostic log */
+BOOL WINAPI krnl386_config_report_enabled(void);
+void WINAPI config_report_note(LPCSTR text);
+/* [otvdm] PreferredMonitor: chosen monitor's rects in this process' coordinates (FALSE if unset) */
+BOOL WINAPI krnl386_get_preferred_monitor(HMONITOR *mon, RECT *bounds, RECT *work);
 BOOL WINAPI krnl386_get_compat_mode(const LPCSTR mode);
 void WINAPI krnl386_set_compat_path(const LPCSTR path);
 #endif /* __WINE_WINE_WINBASE16_H */

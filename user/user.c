@@ -41,6 +41,30 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(user);
 
+/* [otvdm] DIBPalette, read once: it is tested on hot drawing paths */
+static BOOL dib_palette_enabled(void)
+{
+    static int dib_palette = -1;
+    if (dib_palette < 0)
+        dib_palette = krnl386_get_config_int("otvdm", "DIBPalette", FALSE) ? 1 : 0;
+    return dib_palette;
+}
+
+/* [otvdm] ConfigReport: printf-style diagnostic line in otvdm_config_report.log */
+void report_note( const char *fmt, ... )
+{
+    char buf[256];
+    va_list ap;
+
+    if (!krnl386_config_report_enabled())
+        return;
+    va_start( ap, fmt );
+    _vsnprintf( buf, sizeof(buf) - 1, fmt, ap );
+    va_end( ap );
+    buf[sizeof(buf) - 1] = 0;
+    config_report_note( buf );
+}
+
 /* handle to handle 16 conversions */
 #define HANDLE_16(h32)		HWND_16(h32) /* (LOWORD(h32)) */
 #define HGDIOBJ_16(h32)		HDC_16(h32) /* (LOWORD(h32)) */
@@ -908,7 +932,7 @@ INT16 WINAPI FillRect16( HDC16 hdc, const RECT16 *rect, HBRUSH16 hbrush )
 
     if (!(prevBrush = SelectObject( hdc32, hbrush32 ))) return 0;
 
-    if (krnl386_get_compat_mode("256color") && krnl386_get_config_int("otvdm", "DIBPalette", FALSE) && (GetDeviceCaps(hdc32, TECHNOLOGY) == DT_RASDISPLAY))
+    if (krnl386_get_compat_mode("256color") && dib_palette_enabled() && (GetDeviceCaps(hdc32, TECHNOLOGY) == DT_RASDISPLAY))
     {
         DIBSECTION dib;
         HBITMAP hbmp = GetCurrentObject(hdc32, OBJ_BITMAP);
@@ -1594,17 +1618,101 @@ HACCEL16 WINAPI LoadAccelerators16(HINSTANCE16 instance, LPCSTR lpTableName)
 /***********************************************************************
  *		GetSystemMetrics (USER.179)
  */
+static BOOL fix_screen_size_enabled( void )
+{
+    static int fix_screen_size = -1;
+    if (fix_screen_size < 0)
+        fix_screen_size = krnl386_get_config_int("otvdm", "FixScreenSize", FALSE) ? 1 : 0;
+    return fix_screen_size;
+}
+
+/* [otvdm] PreferredMonitor: the win16 app sees the chosen monitor as the
+ * primary display, with its top-left corner at (0,0).  The "app screen" size
+ * is the monitor's work area when FixScreenSize=1 (what FixScreenSize means
+ * for the primary) and its full size otherwise.  Every channel an app can use
+ * to learn the screen size reports the same numbers: GetSystemMetrics,
+ * SPI_GETWORKAREA, the desktop window rect (window.c) and GetDeviceCaps
+ * HORZRES/VERTRES (gdi.c); otherwise the app picks up the real primary from
+ * whichever channel was missed.
+ * The rects come straight from GetMonitorInfo: inside this DPI-unaware
+ * process they are already in the units windows are positioned in, so no
+ * DPI scaling may be applied to them.
+ * Returns FALSE when PreferredMonitor is unset or unresolved. */
+BOOL preferred_monitor_app_screen( SIZE *screen, RECT *work )
+{
+    RECT b, w;
+
+    if (!krnl386_get_preferred_monitor( NULL, &b, &w ))
+        return FALSE;
+    OffsetRect( &w, -b.left, -b.top );
+    if (work) *work = w;
+    if (screen)
+    {
+        const RECT *r = fix_screen_size_enabled() ? &w : &b;
+        screen->cx = r->right - r->left;
+        screen->cy = r->bottom - r->top;
+    }
+    return TRUE;
+}
+
 INT16 WINAPI GetSystemMetrics16( INT16 index )
 {
-    static BOOL init_fix_screen_size;
-    static BOOL fix_screen_size;
-    if (!init_fix_screen_size)
+    SIZE pm_screen;
+    RECT pm_work;
+
+    if ((index == SM_CXSCREEN || index == SM_CYSCREEN ||
+         index == SM_CXFULLSCREEN || index == SM_CYFULLSCREEN ||
+         index == SM_CXMAXIMIZED || index == SM_CYMAXIMIZED) &&
+        preferred_monitor_app_screen( &pm_screen, &pm_work ))
     {
-        init_fix_screen_size = TRUE;
-        fix_screen_size = krnl386_get_config_int("otvdm", "FixScreenSize", FALSE);
+        INT ret = 0;
+        RECT pri_work;
+        switch (index)
+        {
+        case SM_CXSCREEN:     ret = pm_screen.cx; break;
+        case SM_CYSCREEN:     ret = pm_screen.cy; break;
+        /* client size of a maximized window: work area minus the caption */
+        case SM_CXFULLSCREEN: ret = pm_work.right - pm_work.left; break;
+        case SM_CYFULLSCREEN: ret = pm_work.bottom - pm_work.top - GetSystemMetrics( SM_CYCAPTION ); break;
+        /* maximized frame size: keep Windows' frame overhang, swap the work area */
+        case SM_CXMAXIMIZED:
+        case SM_CYMAXIMIZED:
+            if (!SystemParametersInfoA( SPI_GETWORKAREA, 0, &pri_work, FALSE ))
+                SetRectEmpty( &pri_work );
+            if (index == SM_CXMAXIMIZED)
+                ret = GetSystemMetrics( SM_CXMAXIMIZED ) - (pri_work.right - pri_work.left) + (pm_work.right - pm_work.left);
+            else
+                ret = GetSystemMetrics( SM_CYMAXIMIZED ) - (pri_work.bottom - pri_work.top) + (pm_work.bottom - pm_work.top);
+            break;
+        }
+        report_note( "GetSystemMetrics16(PreferredMonitor): index %d -> %d", index, ret );
+        return ret;
+    }
+    /* [otvdm] PreferredMonitor: SM_CXSCREEN/SM_CYSCREEN must report the
+     * CHOSEN monitor's full screen size (bounds, not work area), rebased to
+     * origin (0,0) and unscaled -- exactly what a primary display reports.
+     * Without this the app keeps laying child controls out against the real
+     * primary's width/height even though maximize/work-area now follow the
+     * preferred monitor (Delphi VCL reads SM_CXSCREEN for client sizing). */
+    if (fix_screen_size && preferred_monitor_active( NULL ) &&
+        (index == SM_CXSCREEN || index == SM_CYSCREEN))
+    {
+        RECT scr;
+        if (preferred_monitor_screen_rect( &scr ))
+        {
+            static BOOL logged_scr;
+            if (!logged_scr)
+            {
+                logged_scr = TRUE;
+                config_report_note( "GetSystemMetrics(PreferredMonitor): SM_C%sSCREEN -> %d (chosen-monitor screen size)",
+                                    (index == SM_CXSCREEN) ? "X" : "Y",
+                                    (int)(index == SM_CXSCREEN ? scr.right : scr.bottom) );
+            }
+            return (INT16)min( (index == SM_CXSCREEN ? scr.right : scr.bottom), 32767 );
+        }
     }
     /* Fix the size of the screen to the value considering taskbar. */
-    if (fix_screen_size && (index == SM_CXSCREEN || index == SM_CYSCREEN))
+    if (fix_screen_size_enabled() && (index == SM_CXSCREEN || index == SM_CYSCREEN))
     {
         RECT point;
         if (SystemParametersInfoA(SPI_GETWORKAREA, 0, &point, FALSE))
@@ -2292,7 +2400,7 @@ retry:
         DIBSECTION dib;
         HBITMAP bitmap = GetCurrentObject(hdc32, OBJ_BITMAP);
         int ret = GetObject(bitmap, sizeof(DIBSECTION), &dib);
-        if (krnl386_get_config_int("otvdm", "DIBPalette", FALSE) && (ret == sizeof(DIBSECTION)) && (dib.dsBmih.biBitCount == 8)
+        if (dib_palette_enabled() && (ret == sizeof(DIBSECTION)) && (dib.dsBmih.biBitCount == 8)
                 && !dib.dshSection && (GetPtr16(HBITMAP_16(bitmap), 1) == 0xd1b00001))
         {
             PALETTEENTRY pal[256] = {0};
@@ -2317,7 +2425,7 @@ UINT16 WINAPI RealizePalette16( HDC16 hdc )
     HDC hdc32 = HDC_32(hdc);
     if (krnl386_get_compat_mode("256color"))
     {
-        if (krnl386_get_config_int("otvdm", "DIBPalette", FALSE)
+        if (dib_palette_enabled()
             && (GetDeviceCaps(hdc32, TECHNOLOGY) == DT_RASDISPLAY) && (GetObjectType(hdc32) == OBJ_DC))
             set_realized_palette(hdc32);
     }
@@ -3954,6 +4062,24 @@ BOOL16 WINAPI SystemParametersInfo16( UINT16 uAction, UINT16 uParam,
     case SPI_GETWORKAREA:
     {
 	RECT tmp;
+        /* [otvdm] PreferredMonitor: the chosen monitor's work area, relative
+         * to its own top-left corner (as a primary display reports it) */
+        if (preferred_monitor_app_screen( NULL, &tmp ))
+        {
+            ret = TRUE;
+            if (lpvParam)
+            {
+                RECT16 *r16 = lpvParam;
+                r16->left   = tmp.left;
+                r16->top    = tmp.top;
+                r16->right  = tmp.right;
+                r16->bottom = tmp.bottom;
+            }
+            report_note( "SPI_GETWORKAREA(PreferredMonitor): L%d T%d R%d B%d",
+                         (int)tmp.left, (int)tmp.top, (int)tmp.right, (int)tmp.bottom );
+            break;
+        }
+
 	ret = SystemParametersInfoA( uAction, uParam, lpvParam ? &tmp : NULL, fuWinIni );
 	if (ret && lpvParam)
         {

@@ -331,3 +331,6 @@ EXPORTS
   VDDInstallIOHook
   VDDDeInstallIOHook
   MGetVdmPointer
+  config_report_note
+  krnl386_config_report_enabled
+  krnl386_get_preferred_monitor

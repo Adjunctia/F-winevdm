@@ -45,6 +45,15 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(gdi);
 
+/* [otvdm] DIBPalette, read once: it is tested on hot drawing paths */
+static BOOL dib_palette_enabled(void)
+{
+    static int dib_palette = -1;
+    if (dib_palette < 0)
+        dib_palette = krnl386_get_config_int("otvdm", "DIBPalette", FALSE) ? 1 : 0;
+    return dib_palette;
+}
+
 //#define HGDIOBJ_32(handle16)    ((HGDIOBJ)(ULONG_PTR)(handle16))
 //#define HGDIOBJ_16(handle32)    ((HGDIOBJ16)(ULONG_PTR)(handle32))
 __declspec(dllimport) HGDIOBJ16 K32HGDIOBJ_16(HGDIOBJ handle);
@@ -1258,7 +1267,7 @@ BOOL16 WINAPI StretchBlt16( HDC16 hdcDst, INT16 xDst, INT16 yDst,
 {
     HDC hdcsrc32 = HDC_32(hdcSrc);
     HDC hdcdst32 = HDC_32(hdcDst);
-    if (krnl386_get_compat_mode("256color") && krnl386_get_config_int("otvdm", "DIBPalette", FALSE) && (GetDeviceCaps(hdcsrc32, TECHNOLOGY) == DT_RASDISPLAY))
+    if (krnl386_get_compat_mode("256color") && dib_palette_enabled() && (GetDeviceCaps(hdcsrc32, TECHNOLOGY) == DT_RASDISPLAY))
     {
         DIBSECTION dib, dibdst;
         HBITMAP hbmp = GetCurrentObject(hdcsrc32, OBJ_BITMAP);
@@ -1656,7 +1665,7 @@ HGDIOBJ16 WINAPI SelectObject16( HDC16 hdc, HGDIOBJ16 handle )
     HGDIOBJ handle32 = HGDIOBJ_32(handle);
     HGDIOBJ result = SelectObject( hdc32, handle32 );
     DWORD type = GetObjectType(handle32);
-    if (krnl386_get_compat_mode("256color") && krnl386_get_config_int("otvdm", "DIBPalette", FALSE) && result && (type == OBJ_BITMAP) && (GetCurrentObject(hdc32, OBJ_PAL) != GetStockObject(DEFAULT_PALETTE)))
+    if (krnl386_get_compat_mode("256color") && dib_palette_enabled() && result && (type == OBJ_BITMAP) && (GetCurrentObject(hdc32, OBJ_PAL) != GetStockObject(DEFAULT_PALETTE)))
     {
         DIBSECTION dib;
         int count = GetObject(handle32, sizeof(DIBSECTION), &dib);
@@ -1685,7 +1694,7 @@ HBITMAP16 WINAPI CreateBitmap16( INT16 width, INT16 height, UINT16 planes,
     if (krnl386_get_compat_mode("256color") && (bpp == 8) && (planes == 1))
     {
         HBITMAP16 ret;
-        if (krnl386_get_config_int("otvdm", "DIBPalette", FALSE))
+        if (dib_palette_enabled())
         {
             HDC16 dc = CreateCompatibleDC16(NULL);
             ret = CreateCompatibleBitmap16(dc, width, height);
@@ -1784,7 +1793,7 @@ HBRUSH16 WINAPI CreateBrushIndirect16( const LOGBRUSH16 * brush )
 HBITMAP16 WINAPI CreateCompatibleBitmap16( HDC16 hdc, INT16 width, INT16 height )
 {
     HDC hdc32 = HDC_32(hdc);
-    if (krnl386_get_compat_mode("256color") && krnl386_get_config_int("otvdm", "DIBPalette", FALSE) && (GetDeviceCaps(hdc32, TECHNOLOGY) == DT_RASDISPLAY))
+    if (krnl386_get_compat_mode("256color") && dib_palette_enabled() && (GetDeviceCaps(hdc32, TECHNOLOGY) == DT_RASDISPLAY))
     {
         HBITMAP16 ret;
         VOID *section;
@@ -1816,7 +1825,7 @@ HDC16 WINAPI CreateCompatibleDC16( HDC16 hdc )
     HDC hdc32 = CreateCompatibleDC( HDC_32(hdc) );
     if (IsOldWindowsTask(GetCurrentTask()) && !(get_aflags(GetExePtr(GetCurrentTask())) & NE_AFLAGS_WIN2_PROTMODE) && (GetCurrentObject(hdc32, OBJ_FONT) == GetStockObject(SYSTEM_FONT)))
         SelectObject(hdc32, GetStockObject(SYSTEM_FIXED_FONT));
-    if (krnl386_get_compat_mode("256color") && krnl386_get_config_int("otvdm", "DIBPalette", FALSE) && (GetDeviceCaps(hdc32, TECHNOLOGY) == DT_RASDISPLAY))
+    if (krnl386_get_compat_mode("256color") && dib_palette_enabled() && (GetDeviceCaps(hdc32, TECHNOLOGY) == DT_RASDISPLAY))
         SelectPalette16(HDC_16(hdc32), HPALETTE_16(get_realized_palette()), FALSE);
     return HDC_16(hdc32);
 }
@@ -2194,7 +2203,7 @@ void delete_dib_driver(HDC hdc)
 BOOL16 WINAPI DeleteDC16( HDC16 hdc )
 {
     HDC hdc32 = HDC_32(hdc);
-    if (krnl386_get_compat_mode("256color") && krnl386_get_config_int("otvdm", "DIBPalette", FALSE) && (GetDeviceCaps(hdc32, TECHNOLOGY) == DT_RASDISPLAY))
+    if (krnl386_get_compat_mode("256color") && dib_palette_enabled() && (GetDeviceCaps(hdc32, TECHNOLOGY) == DT_RASDISPLAY))
         SelectPalette(hdc32, GetStockObject(DEFAULT_PALETTE), FALSE);
     if (DeleteDC( hdc32 ))
     {
@@ -2407,6 +2416,22 @@ INT16 WINAPI GetDeviceCaps16( HDC16 hdc, INT16 cap )
     }
     else if (((cap == NUMCOLORS) || (cap == NUMPENS)) && (ret == -1)) ret = 2048;
     else if (cap == VREFRESH) ret = 1;
+    /* [otvdm] PreferredMonitor: report the chosen monitor's size, matching
+     * GetSystemMetrics16(SM_CXSCREEN/SM_CYSCREEN) in user.c (work area when
+     * FixScreenSize=1, full monitor otherwise) */
+    if ((cap == HORZRES || cap == VERTRES) && (GetDeviceCaps(hdc32, TECHNOLOGY) == DT_RASDISPLAY))
+    {
+        static int fix_screen_size = -1;
+        RECT bounds, work;
+        if (krnl386_get_preferred_monitor(NULL, &bounds, &work))
+        {
+            RECT *rc;
+            if (fix_screen_size < 0)
+                fix_screen_size = krnl386_get_config_int("otvdm", "FixScreenSize", FALSE) ? 1 : 0;
+            rc = fix_screen_size ? &work : &bounds;
+            ret = (INT16)((cap == HORZRES) ? rc->right - rc->left : rc->bottom - rc->top);
+        }
+    }
     if (krnl386_get_compat_mode("640X480") && (GetDeviceCaps(hdc32, TECHNOLOGY) == DT_RASDISPLAY))
     {
         switch (cap)
@@ -2425,7 +2450,9 @@ INT16 WINAPI GetDeviceCaps16( HDC16 hdc, INT16 cap )
                 break;
         }
     }
-    int newdpi = krnl386_get_config_int("otvdm", "AdjustDPI", FALSE);
+    static int newdpi = -1;
+    if (newdpi < 0)
+        newdpi = krnl386_get_config_int("otvdm", "AdjustDPI", FALSE);
     if (newdpi)
     {
         switch (cap)
@@ -2830,7 +2857,7 @@ LONG WINAPI SetBitmapBits16( HBITMAP16 hbitmap, LONG count, LPCVOID buffer )
         for (int i = 0; i < 256; i++)
             colors[i] = i;
         HPALETTE oldpal = GetCurrentObject(dc, OBJ_PAL);
-        if (krnl386_get_config_int("otvdm", "DIBPalette", FALSE))
+        if (dib_palette_enabled())
             SelectPalette(dc, get_realized_palette(), FALSE);
         int ret = SetDIBits(dc, hbmp32, 0, abs(bmap->bmiHeader.biHeight), buffer, bmap, DIB_PAL_COLORS);
         HeapFree(GetProcessHeap(), 0, bmap);
@@ -3791,7 +3818,7 @@ HPALETTE16 WINAPI GDISelectPalette16( HDC16 hdc, HPALETTE16 hpalette, WORD wBkg 
 UINT16 WINAPI GDIRealizePalette16( HDC16 hdc )
 {
     HDC hdc32 = HDC_32(hdc);
-    if (krnl386_get_compat_mode("256color") && krnl386_get_config_int("otvdm", "DIBPalette", FALSE) && (GetDeviceCaps(hdc32, TECHNOLOGY) == DT_RASDISPLAY) &&
+    if (krnl386_get_compat_mode("256color") && dib_palette_enabled() && (GetDeviceCaps(hdc32, TECHNOLOGY) == DT_RASDISPLAY) &&
         (GetObjectType(hdc32) == OBJ_DC))
         set_realized_palette(hdc32);
     return RealizePalette(hdc32);
@@ -3859,7 +3886,7 @@ BOOL update_palette(HPALETTE16 hpalette)
                     RedrawWindow(hwnd, NULL, NULL, RDW_INVALIDATE | RDW_UPDATENOW);
                 }
             }
-            else if (krnl386_get_config_int("otvdm", "DIBPalette", FALSE))
+            else if (dib_palette_enabled())
             {
                 DIBSECTION dib;
                 HBITMAP bitmap = GetCurrentObject(hdc32, OBJ_BITMAP);
@@ -3869,7 +3896,7 @@ BOOL update_palette(HPALETTE16 hpalette)
             }
         }
     }
-    if (krnl386_get_config_int("otvdm", "DIBPalette", FALSE) && (hpal32 == get_realized_palette()))
+    if (dib_palette_enabled() && (hpal32 == get_realized_palette()))
         EnumThreadWindows(GetCurrentThreadId(), paint_all_windows, wndlist);
     HeapFree(GetProcessHeap(), 0, wndlist);
 }
@@ -3962,7 +3989,7 @@ UINT16 WINAPI GetSystemPaletteUse16( HDC16 hdc )
 UINT16 WINAPI GetSystemPaletteEntries16( HDC16 hdc, UINT16 start, UINT16 count,
                                          LPPALETTEENTRY entries )
 {
-    if (krnl386_get_compat_mode("256color") && krnl386_get_config_int("otvdm", "DIBPalette", FALSE))
+    if (krnl386_get_compat_mode("256color") && dib_palette_enabled())
     {
         HPALETTE hpal = get_realized_palette();
         if (hpal == GetStockObject(DEFAULT_PALETTE))
@@ -4196,7 +4223,7 @@ INT16 WINAPI StretchDIBits16( HDC16 hdc, INT16 xDst, INT16 yDst, INT16 widthDst,
         memcpy(bmp, info, hdrsize);
         bmp->bmiHeader.biSizeImage = rle_size(info->bmiHeader.biCompression, bits);
     }
-    else if (krnl386_get_compat_mode("256color") && krnl386_get_config_int("otvdm", "DIBPalette", FALSE) && (GetDeviceCaps(hdc32, TECHNOLOGY) == DT_RASDISPLAY) && (info->bmiHeader.biBitCount == 8)) // this doesn't support RLE8 right now
+    else if (krnl386_get_compat_mode("256color") && dib_palette_enabled() && (GetDeviceCaps(hdc32, TECHNOLOGY) == DT_RASDISPLAY) && (info->bmiHeader.biBitCount == 8)) // this doesn't support RLE8 right now
     {
         DIBSECTION dib;
         HBITMAP hbmp = GetCurrentObject(hdc32, OBJ_BITMAP);
@@ -4318,7 +4345,7 @@ HBITMAP16 WINAPI CreateDIBitmap16( HDC16 hdc, const BITMAPINFOHEADER * header,
         memcpy(bmp, data, hdrsize);
         bmp->bmiHeader.biSizeImage = rle_size(data->bmiHeader.biCompression, bits);
     }
-    if (krnl386_get_compat_mode("256color") && krnl386_get_config_int("otvdm", "DIBPalette", FALSE))
+    if (krnl386_get_compat_mode("256color") && dib_palette_enabled())
     {
         HDC16 hdc2 = CreateCompatibleDC16(hdc);
         HDC hdc232 = HDC_32(hdc2);

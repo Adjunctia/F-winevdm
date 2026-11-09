@@ -27,6 +27,137 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(win);
 
+/***********************************************************************
+ *              [otvdm] PreferredMonitor window placement
+ *
+ * The app believes the chosen monitor is the primary display, with its
+ * top-left corner at (0,0) (see preferred_monitor_app_screen in user.c), so
+ * the positions it gives top-level windows are relative to that corner.
+ *
+ * preferred_monitor_to_real() shifts such a rect onto the real monitor.  It
+ * leaves alone rects that already sit on the chosen monitor (e.g. popups the
+ * app placed with ClientToScreen, which returns real coordinates), so it is
+ * safe to apply to every top-level positioning call.
+ *
+ * preferred_monitor_to_app() is the inverse for positions reported back to
+ * the app (GetWindowRect, GetWindowPlacement, WM_MOVE, WINDOWPOS) of top-level
+ * windows on the chosen monitor.  The app therefore never sees the negative
+ * coordinates of a monitor left of / above the primary, which apps "fix" by
+ * moving the window back to (0,0) -- i.e. onto the real primary.
+ *
+ * Child windows use parent-client coordinates and are never touched.
+ */
+static BOOL pm_is_toplevel( HWND hwnd )
+{
+    return hwnd && IsWindow( hwnd ) && hwnd != GetDesktopWindow() &&
+           !(GetWindowLongA( hwnd, GWL_STYLE ) & WS_CHILD);
+}
+
+/* chosen monitor + its bounds; FALSE when unset or when it already sits at
+ * (0,0), in which case no coordinate shift is needed */
+static BOOL pm_origin( HMONITOR *mon, RECT *bounds )
+{
+    if (!krnl386_get_preferred_monitor( mon, bounds, NULL ))
+        return FALSE;
+    return bounds->left || bounds->top;
+}
+
+BOOL preferred_monitor_to_real( HWND hwnd, INT *x, INT *y, INT cx, INT cy )
+{
+    HMONITOR mon;
+    RECT b, rc, nominal, tmp;
+
+    if (!pm_origin( &mon, &b ))
+        return FALSE;
+    if (hwnd && !pm_is_toplevel( hwnd ))
+        return FALSE;
+    if (*x <= -32000 || *y <= -32000)   /* minimized / parked off-screen */
+        return FALSE;
+    SetRect( &rc, *x, *y, *x + max( cx, 1 ), *y + max( cy, 1 ) );
+    if (MonitorFromRect( &rc, MONITOR_DEFAULTTONULL ) == mon)
+        return FALSE;                   /* already real coordinates */
+    SetRect( &nominal, 0, 0, b.right - b.left, b.bottom - b.top );
+    if (!IntersectRect( &tmp, &rc, &nominal ))
+        return FALSE;                   /* not on the app's screen at all */
+    *x += b.left;
+    *y += b.top;
+    return TRUE;
+}
+
+BOOL preferred_monitor_to_app( HWND hwnd, INT *x, INT *y, INT cx, INT cy )
+{
+    HMONITOR mon;
+    RECT b, rc;
+
+    if (!pm_origin( &mon, &b ))
+        return FALSE;
+    if (hwnd && !pm_is_toplevel( hwnd ))
+        return FALSE;
+    if (*x <= -32000 || *y <= -32000)
+        return FALSE;
+    SetRect( &rc, *x, *y, *x + max( cx, 1 ), *y + max( cy, 1 ) );
+    if (MonitorFromRect( &rc, MONITOR_DEFAULTTONULL ) != mon)
+        return FALSE;
+    *x -= b.left;
+    *y -= b.top;
+    return TRUE;
+}
+
+/* Move a normal (not minimized/maximized) top-level window onto the chosen
+ * monitor if it is not there yet, e.g. a CW_USEDEFAULT window Windows put on
+ * the primary, or one about to be maximized (Windows maximizes onto the
+ * monitor the window is on). */
+static void pm_move_onto_monitor( HWND hwnd )
+{
+    HMONITOR mon;
+    RECT b, work, rc;
+    INT x, y;
+
+    if (!krnl386_get_preferred_monitor( &mon, &b, &work ))
+        return;
+    if (!pm_is_toplevel( hwnd ) || IsIconic( hwnd ) || IsZoomed( hwnd ))
+        return;
+    if (MonitorFromWindow( hwnd, MONITOR_DEFAULTTONULL ) == mon || !GetWindowRect( hwnd, &rc ))
+        return;
+    x = rc.left;
+    y = rc.top;
+    if (!preferred_monitor_to_real( NULL, &x, &y, rc.right - rc.left, rc.bottom - rc.top ))
+    {
+        x = work.left;
+        y = work.top;
+    }
+    SetWindowPos( hwnd, NULL, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE );
+    report_note( "PreferredMonitor: moved top-level window from (%d,%d) to (%d,%d)",
+                 (int)rc.left, (int)rc.top, x, y );
+}
+
+/* [otvdm] ConfigReport: log the monitor layout once per process */
+static BOOL CALLBACK report_monitor_proc( HMONITOR mon, HDC hdc, LPRECT rect, LPARAM lparam )
+{
+    MONITORINFOEXA mi;
+    UINT *index = (UINT *)lparam;
+
+    mi.cbSize = sizeof(mi);
+    if (GetMonitorInfoA( mon, (MONITORINFO *)&mi ))
+        report_note( "monitor[%u] %s: bounds L%d T%d R%d B%d, work L%d T%d R%d B%d%s", *index, mi.szDevice,
+                     (int)mi.rcMonitor.left, (int)mi.rcMonitor.top, (int)mi.rcMonitor.right, (int)mi.rcMonitor.bottom,
+                     (int)mi.rcWork.left, (int)mi.rcWork.top, (int)mi.rcWork.right, (int)mi.rcWork.bottom,
+                     (mi.dwFlags & MONITORINFOF_PRIMARY) ? " [primary]" : "" );
+    (*index)++;
+    return TRUE;
+}
+
+static void report_monitors( void )
+{
+    static BOOL done;
+    UINT index = 0;
+
+    if (done || !krnl386_config_report_enabled())
+        return;
+    done = TRUE;
+    EnumDisplayMonitors( NULL, NULL, report_monitor_proc, (LPARAM)&index );
+}
+
 struct {
     int next;
     HDC16 dcs[5];
@@ -614,10 +745,23 @@ BOOL16 WINAPI IsIconic16(HWND16 hwnd)
  */
 void WINAPI GetWindowRect16( HWND16 hwnd, LPRECT16 rect )
 {
+    HWND hwnd32 = WIN_Handle32(hwnd);
     RECT rect32;
+    SIZE screen;
 
-    if (GetWindowRect( WIN_Handle32(hwnd), &rect32 ))
+    /* [otvdm] PreferredMonitor: see preferred_monitor_to_app */
+    if (hwnd32 == GetDesktopWindow() && preferred_monitor_app_screen( &screen, NULL ))
     {
+        rect->left = rect->top = 0;
+        rect->right  = (INT16)screen.cx;
+        rect->bottom = (INT16)screen.cy;
+        return;
+    }
+    if (GetWindowRect( hwnd32, &rect32 ))
+    {
+        INT x = rect32.left, y = rect32.top;
+        if (preferred_monitor_to_app( hwnd32, &x, &y, rect32.right - rect32.left, rect32.bottom - rect32.top ))
+            OffsetRect( &rect32, x - rect32.left, y - rect32.top );
         rect->left   = rect32.left;
         rect->top    = rect32.top;
         rect->right  = rect32.right;
@@ -632,7 +776,15 @@ void WINAPI GetWindowRect16( HWND16 hwnd, LPRECT16 rect )
 void WINAPI GetClientRect16( HWND16 hwnd, LPRECT16 rect )
 {
     RECT rect32;
+    SIZE screen;
 
+    if (WIN_Handle32(hwnd) == GetDesktopWindow() && preferred_monitor_app_screen( &screen, NULL ))
+    {
+        rect->left = rect->top = 0;
+        rect->right  = (INT16)screen.cx;
+        rect->bottom = (INT16)screen.cy;
+        return;
+    }
     if (GetClientRect( WIN_Handle32(hwnd), &rect32 ))
     {
         rect->left   = rect32.left;
@@ -775,8 +927,11 @@ HWND16 WINAPI CreateWindow16( LPCSTR className, LPCSTR windowName,
 BOOL16 WINAPI ShowWindow16( HWND16 hwnd, INT16 cmd )
 {
     DWORD count;
-
     ReleaseThunkLock(&count);
+    /* [otvdm] PreferredMonitor: Windows maximizes onto the monitor the window
+     * is on, so make sure that is the chosen one */
+    if (cmd == SW_SHOWMAXIMIZED)
+        pm_move_onto_monitor( WIN_Handle32(hwnd) );
 #ifdef ATTACH_THREAD_INPUT
     DWORD foregroundID = GetWindowThreadProcessId(GetForegroundWindow(), NULL);
     //Attach
@@ -1158,7 +1313,8 @@ void init_dcemu()
     wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
     wc.lpszClassName = L"DesktopDCEmulation";
     RegisterClassW(&wc);
-    SystemParametersInfoW(SPI_GETWORKAREA, 0, &wkara, 0);
+    if (!krnl386_get_preferred_monitor(NULL, NULL, &wkara))
+        SystemParametersInfoW(SPI_GETWORKAREA, 0, &wkara, 0);
     hwnd = CreateWindowExW(WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST, L"DesktopDCEmulation", L"", 0, wkara.left, wkara.top, wkara.right - wkara.left, wkara.bottom - wkara.top, NULL, NULL, NULL, NULL);
     if (!hwnd)
         return;
@@ -2178,8 +2334,33 @@ BOOL16 WINAPI SetWindowPos16( HWND16 hwnd, HWND16 hwndInsertAfter,
     }
     DWORD count;
     ReleaseThunkLock(&count);
+    /* [otvdm] PreferredMonitor: see preferred_monitor_to_real */
+    INT rx = x, ry = y;
+    BOOL pm_moved = FALSE;
+    if (!(flags & SWP_NOMOVE) && hwnd32 == WIN_Handle32(hwnd))
+    {
+        INT w = cx, h = cy;
+        RECT cur;
+        if ((flags & SWP_NOSIZE) && GetWindowRect( hwnd32, &cur ))
+        {
+            w = cur.right - cur.left;
+            h = cur.bottom - cur.top;
+        }
+        pm_moved = preferred_monitor_to_real( hwnd32, &rx, &ry, w, h );
+    }
     BOOL16 result = SetWindowPos( hwnd32, full_insert_after_hwnd(hwndInsertAfter),
-                         x, y, cx, cy, flags );
+                         rx, ry, cx, cy, flags );
+    if (!(flags & SWP_NOSIZE) && hwnd32 == WIN_Handle32(hwnd) && krnl386_config_report_enabled())
+    {
+        RECT after;
+        char classname[64];
+        GetWindowRect( hwnd32, &after );
+        if (!GetClassNameA( hwnd32, classname, sizeof(classname) ))
+            classname[0] = 0;
+        report_note( "SetWindowPos16 '%s': (%d,%d %dx%d)%s -> L%d T%d R%d B%d",
+                     classname, x, y, cx, cy, pm_moved ? " moved to PreferredMonitor" : "",
+                     (int)after.left, (int)after.top, (int)after.right, (int)after.bottom );
+    }
     RestoreThunkLock(count);
     return result;
 }
@@ -2274,8 +2455,23 @@ HDWP16 WINAPI DeferWindowPos16( HDWP16 hdwp, HWND16 hwnd, HWND16 hwndAfter,
                                 INT16 x, INT16 y, INT16 cx, INT16 cy,
                                 UINT16 flags )
 {
-    return HDWP_16(DeferWindowPos( HDWP_32(hdwp), WIN_Handle32(hwnd),
-		   full_insert_after_hwnd(hwndAfter), x, y, cx, cy, flags ));
+    HWND hwnd32 = WIN_Handle32(hwnd);
+    INT rx = x, ry = y;
+
+    /* [otvdm] PreferredMonitor: see preferred_monitor_to_real */
+    if (!(flags & SWP_NOMOVE))
+    {
+        INT w = cx, h = cy;
+        RECT cur;
+        if ((flags & SWP_NOSIZE) && GetWindowRect( hwnd32, &cur ))
+        {
+            w = cur.right - cur.left;
+            h = cur.bottom - cur.top;
+        }
+        preferred_monitor_to_real( hwnd32, &rx, &ry, w, h );
+    }
+    return HDWP_16(DeferWindowPos( HDWP_32(hdwp), hwnd32,
+		   full_insert_after_hwnd(hwndAfter), rx, ry, cx, cy, flags ));
 }
 
 
@@ -2528,6 +2724,13 @@ BOOL16 WINAPI GetWindowPlacement16( HWND16 hwnd, WINDOWPLACEMENT16 *wp16 )
 
     wpl.length = sizeof(wpl);
     if (!GetWindowPlacement( WIN_Handle32(hwnd), &wpl )) return FALSE;
+    {
+        /* [otvdm] PreferredMonitor: see preferred_monitor_to_app */
+        RECT *rc = &wpl.rcNormalPosition;
+        INT x = rc->left, y = rc->top;
+        if (preferred_monitor_to_app( WIN_Handle32(hwnd), &x, &y, rc->right - rc->left, rc->bottom - rc->top ))
+            OffsetRect( rc, x - rc->left, y - rc->top );
+    }
     wp16->length  = sizeof(*wp16);
     wp16->flags   = wpl.flags;
     wp16->showCmd = wpl.showCmd;
@@ -2562,6 +2765,13 @@ BOOL16 WINAPI SetWindowPlacement16( HWND16 hwnd, const WINDOWPLACEMENT16 *wp16 )
     wpl.rcNormalPosition.top    = wp16->rcNormalPosition.top;
     wpl.rcNormalPosition.right  = wp16->rcNormalPosition.right;
     wpl.rcNormalPosition.bottom = wp16->rcNormalPosition.bottom;
+    {
+        /* [otvdm] PreferredMonitor: see preferred_monitor_to_real */
+        RECT *rc = &wpl.rcNormalPosition;
+        INT x = rc->left, y = rc->top;
+        if (preferred_monitor_to_real( WIN_Handle32(hwnd), &x, &y, rc->right - rc->left, rc->bottom - rc->top ))
+            OffsetRect( rc, x - rc->left, y - rc->top );
+    }
     DWORD count;
     ReleaseThunkLock(&count);
     BOOL ret = SetWindowPlacement( WIN_Handle32(hwnd), &wpl );
@@ -3177,6 +3387,12 @@ HWND16 WINAPI CreateWindowEx16( DWORD exStyle, LPCSTR className,
     cs.cx = (width == CW_USEDEFAULT16) ? CW_USEDEFAULT : (INT)width;
     cs.cy = (height == CW_USEDEFAULT16) ? CW_USEDEFAULT : (INT)height;
 
+    /* [otvdm] PreferredMonitor: see preferred_monitor_to_real */
+    if (!(style & WS_CHILD) && cs.x != CW_USEDEFAULT && cs.y != CW_USEDEFAULT)
+        preferred_monitor_to_real( NULL, &cs.x, &cs.y,
+                                   cs.cx == CW_USEDEFAULT ? 1 : cs.cx,
+                                   cs.cy == CW_USEDEFAULT ? 1 : cs.cy );
+
     if (!(style & (WS_POPUP | WS_CHILD)))
         style |= WS_CAPTION;
 
@@ -3270,6 +3486,26 @@ HWND16 WINAPI CreateWindowEx16( DWORD exStyle, LPCSTR className,
     SetWindowHInst16(hWnd16, instance);
     if (!GetWindowHMenu16(hWnd16))
         SetWindowHMenu16(hWnd16, menu);
+
+    if (!(style & WS_CHILD))
+    {
+        ReleaseThunkLock(&count);
+        /* [otvdm] PreferredMonitor: Windows puts CW_USEDEFAULT windows on the
+         * primary monitor */
+        if (cs.x == CW_USEDEFAULT)
+            pm_move_onto_monitor( hwnd );
+        if (krnl386_config_report_enabled())
+        {
+            RECT rc;
+            report_monitors();
+            GetWindowRect( hwnd, &rc );
+            report_note( "CreateWindowEx16 '%s': (%d,%d %dx%d) -> L%d T%d R%d B%d%s",
+                         IS_INTRESOURCE(className) ? "(atom)" : className, x, y, width, height,
+                         (int)rc.left, (int)rc.top, (int)rc.right, (int)rc.bottom,
+                         (style & WS_MAXIMIZE) ? " [WS_MAXIMIZE]" : "" );
+        }
+        RestoreThunkLock(count);
+    }
     return hWnd16;
 }
 void InitWndProc16(HWND hWnd, HWND16 hWnd16)

@@ -1655,6 +1655,39 @@ LRESULT WINPROC_CallProc16To32A( winproc_callback_t callback, HWND16 hwnd, UINT1
 
             MINMAXINFO16to32( mmi16, &mmi );
             ret = callback( hwnd32, msg, wParam, (LPARAM)&mmi, result, arg );
+            /* [otvdm] PreferredMonitor: the Win16 app's window manager
+             * (Delphi VCL etc.) reads WM_GETMINMAXINFO for maximize geometry
+             * and caches it for MDI-client/fullscreen sizing. The default
+             * MINMAXINFO comes from DefWindowProc and describes the REAL
+             * primary monitor -- exactly what keeps OSCAR laying out at the
+             * primary's size while we place the frame on the chosen panel.
+             * Rewrite every field to the chosen monitor's app-space geometry
+             * (bounds via preferred_monitor_screen_rect, work area via
+             * preferred_monitor_work_rect; both already origin-rebased to
+             * (0,0) and unscaled). ptMaxTrackSize gets the same treatment as
+             * Windows itself: bounds + full frame decoration. */
+            {
+                RECT pmscr, pmwork;
+                if (preferred_monitor_active( NULL ) &&
+                    preferred_monitor_screen_rect( &pmscr ) &&
+                    preferred_monitor_work_rect( &pmwork, NULL, NULL ))
+                {
+                    INT bx = pmscr.right, by = pmscr.bottom;          /* bounds size */
+                    INT wx = pmwork.right - pmwork.left;              /* work size   */
+                    INT wy = pmwork.bottom - pmwork.top;
+                    INT dx = bx - wx, dy = by - wy;                   /* taskbar pad */
+                    INT fx = 2 * GetSystemMetrics( SM_CXSIZEFRAME ) + 8;
+                    INT fy = 2 * GetSystemMetrics( SM_CYSIZEFRAME ) + GetSystemMetrics( SM_CYCAPTION ) + 8;
+                    mmi.ptMaxPosition.x = -dx;    /* Windows convention: maximized */
+                    mmi.ptMaxPosition.y = -dy;    /* frame sits at (-pad,-pad)      */
+                    mmi.ptMaxSize.x     = bx + fx;
+                    mmi.ptMaxSize.y     = by + fy;
+                    mmi.ptMinTrackSize.x = min( mmi.ptMinTrackSize.x, bx + fx );
+                    mmi.ptMinTrackSize.y = min( mmi.ptMinTrackSize.y, by + fy );
+                    mmi.ptMaxTrackSize.x = bx + fx;
+                    mmi.ptMaxTrackSize.y = by + fy;
+                }
+            }
             MINMAXINFO32to16( &mmi, mmi16 );
         }
         break;
@@ -1665,7 +1698,19 @@ LRESULT WINPROC_CallProc16To32A( winproc_callback_t callback, HWND16 hwnd, UINT1
             WINDOWPOS winpos;
 
             WINDOWPOS16to32( winpos16, &winpos );
+            /* [otvdm] PreferredMonitor: see preferred_monitor_to_real (window.c) */
+            INT pmx = winpos.x, pmy = winpos.y, pmdx = 0, pmdy = 0;
+            if (!(winpos.flags & SWP_NOMOVE) &&
+                preferred_monitor_to_real( hwnd32, &pmx, &pmy, winpos.cx, winpos.cy ))
+            {
+                pmdx = pmx - winpos.x;
+                pmdy = pmy - winpos.y;
+                winpos.x = pmx;
+                winpos.y = pmy;
+            }
             ret = callback( hwnd32, msg, wParam, (LPARAM)&winpos, result, arg );
+            winpos.x -= pmdx;
+            winpos.y -= pmdy;
             WINDOWPOS32to16( &winpos, winpos16 );
         }
         break;
@@ -2325,10 +2370,22 @@ LRESULT WINPROC_CallProc32ATo16( winproc_callback16_t callback, HWND hwnd, UINT 
             }
 
             WINDOWPOS32to16( winpos32, &winpos );
+            /* [otvdm] PreferredMonitor: see preferred_monitor_to_app (window.c) */
+            INT pmx = winpos32->x, pmy = winpos32->y, pmdx = 0, pmdy = 0;
+            if (!(winpos32->flags & SWP_NOMOVE) &&
+                preferred_monitor_to_app( hwnd, &pmx, &pmy, winpos32->cx, winpos32->cy ))
+            {
+                pmdx = winpos32->x - pmx;
+                pmdy = winpos32->y - pmy;
+                winpos.x = pmx;
+                winpos.y = pmy;
+            }
             lParam = MapLS( &winpos );
             ret = callback( HWND_16(hwnd), msg, wParam, lParam, result, arg );
             UnMapLS( lParam );
             WINDOWPOS16to32( &winpos, winpos32 );
+            winpos32->x += pmdx;
+            winpos32->y += pmdy;
         }
         break;
     case WM_COMPAREITEM:
@@ -2968,6 +3025,15 @@ LRESULT WINPROC_CallProc32ATo16( winproc_callback16_t callback, HWND hwnd, UINT 
     case WM_DROPFILES:
         ret = callback(HWND_16(hwnd), msg, (WPARAM16)hdrop32_to_hdrop16((HDROP)wParam), lParam, result, arg);
         break;
+    case WM_MOVE:
+    {
+        /* [otvdm] PreferredMonitor: see preferred_monitor_to_app (window.c) */
+        INT x = (SHORT)LOWORD(lParam), y = (SHORT)HIWORD(lParam);
+        if (preferred_monitor_to_app( hwnd, &x, &y, 1, 1 ))
+            lParam = MAKELPARAM( x, y );
+        ret = callback( HWND_16(hwnd), msg, wParam, lParam, result, arg );
+        break;
+    }
     default:
     {
         if (msg != WM_NULL && msg == drag_list_message)

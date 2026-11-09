@@ -1934,13 +1934,10 @@ const char *env_var_limitation[] =
 };
 static BOOL env_var_limit(const char *v)
 {
-    static BOOL init;
+    static int limit = -1;
     int i;
-    static BOOL limit;
-    if (!init)
-    {
-        limit = krnl386_get_config_int("otvdm", "EnvironmentVariableLimitation", TRUE);
-    }
+    if (limit < 0)
+        limit = krnl386_get_config_int("otvdm", "EnvironmentVariableLimitation", TRUE) ? 1 : 0;
     if (!limit)
         return TRUE;
     SIZE_T len = strchr(v, '=') ? strchr(v, '=') - v : strlen(v);
